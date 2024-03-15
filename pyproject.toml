@@ -6,10 +6,11 @@ authors = ["twt6xy <twt6xy@virginia.edu>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.9,<3.12"
 pandas = "^2.2.1"
 numpy = "^1.26.4"
 tensorflow = "^2.16.1"
+tensorflow-io-gcs-filesystem = "^0.31.0"
 requests = "^2.31.0"
 roboflow = "^1.1.23"
 matplotlib = "^3.8.3"
