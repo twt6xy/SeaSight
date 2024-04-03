@@ -14,6 +14,9 @@ requests = "^2.31.0"
 roboflow = "^1.1.23"
 matplotlib = "^3.8.3"
 keras = "^3.1.1"
+keras-cv = "^0.8.2"
+pycocotools = "^2.0.7"
+imageio = "^2.34.0"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -23,6 +26,7 @@ pytest = "^8.1.1"
 isort = "^5.13.2"
 ruff = "^0.3.2"
 ipykernel = "^6.29.3"
+tensorflow-docs = "^2024.2.5.73858"
 
 [build-system]
 requires = ["poetry-core"]

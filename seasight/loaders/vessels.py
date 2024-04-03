@@ -1,54 +1,48 @@
-from typing import Dict, Literal, Tuple
+from typing import Dict, Literal
 
+import keras_cv
 import tensorflow as tf
 
 
 class VesselDatasetLoader:
-    """
-    A loader for creating TensorFlow datasets from TFRecord files for vessel detection.
-
-    Attributes:
-        dataset_dir (str): Directory containing the TFRecord files.
-        batch_size (int): Number of samples per batch.
-        autotune (tf.data.experimental.AUTOTUNE): Constant used to denote that the number of parallel calls is to be determined at runtime based on available CPU.
-        label_map (dict): Mapping from label IDs to human-readable string labels.
-    """
-
-    def __init__(
-        self,
-        dataset_dir: str,
-        batch_size: int = 32,
-        autotune: int = tf.data.experimental.AUTOTUNE,
-    ):
-        """
-        Initializes the vessel dataset loader class.
-        """
+    def __init__(self, dataset_dir: str, label_map_path: str):
         self.dataset_dir = dataset_dir
-        self.batch_size = batch_size
-        self.autotune = autotune
-        self.label_map = {
-            1: "Fishing Boat",
-            2: "Merchant Ship",
-            3: "Military Ship",
-            4: "Patrol Boat",
-            5: "Sails Boat",
-            6: "Submarine",
-            7: "Tugboat",
-            8: "Yacht",
-        }
+        self.label_map = self.parse_label_map(label_map_path)
+        self.autotune = tf.data.AUTOTUNE
 
-    def parse_tfrecord_fn(
-        self, example: tf.Tensor
-    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+    def parse_label_map(self, label_map_path: str):
         """
-        Parses a single example from a TFRecord file.
+        Parses the label mapping from tthe pbtxt file
 
         Parameters:
-            example (tf.Tensor): A serialized example from a TFRecord file.
+            label_map_path: (str): Path to one of the pbtxt files.
 
         Returns:
-            tuple: A tuple containing the decoded image and a dictionary with the corresponding labels and bounding boxes.
+            dict: A dictionary containing the label mapping
         """
+        class_table = {}
+        with open(label_map_path, "r") as file:
+            for line in file:
+                line = line.strip()
+                if line.startswith("name:"):
+                    class_name = line.split('"')[1]
+                elif line.startswith("id:"):
+                    class_id = int(line.split(":")[1].strip().rstrip(","))
+                    class_table[class_id] = class_name
+        return class_table
+
+    def parse_tfrecord_fn(self, example: tf.Tensor, bounding_box_format: str) -> Dict:
+        """
+        Parses a TFRecord example into formatted images and bounding boxes.
+
+        Parameters:
+        - example: A serialized TFRecord example.
+        - bounding_box_format: The target format for bounding boxes.
+
+        Returns:
+        A dictionary with keys 'images' and 'bounding_boxes'.
+        """
+        # Feature description for TFRecord example parsing
         feature_description = {
             "image/encoded": tf.io.FixedLenFeature([], tf.string),
             "image/object/class/label": tf.io.VarLenFeature(tf.int64),
@@ -57,37 +51,94 @@ class VesselDatasetLoader:
             "image/object/bbox/ymin": tf.io.VarLenFeature(tf.float32),
             "image/object/bbox/ymax": tf.io.VarLenFeature(tf.float32),
         }
-        example = tf.io.parse_single_example(example, feature_description)
-        image = tf.image.decode_jpeg(example["image/encoded"], channels=3)
-        labels = tf.sparse.to_dense(example["image/object/class/label"])
-        xmin = tf.sparse.to_dense(example["image/object/bbox/xmin"])
-        xmax = tf.sparse.to_dense(example["image/object/bbox/xmax"])
-        ymin = tf.sparse.to_dense(example["image/object/bbox/ymin"])
-        ymax = tf.sparse.to_dense(example["image/object/bbox/ymax"])
-        bboxes = tf.stack([ymin, xmin, ymax, xmax], axis=-1)
-        return image, {"labels": labels, "bboxes": bboxes}
+        parsed_example = tf.io.parse_single_example(example, feature_description)
 
-    def create_dataset(
-        self, subset: Literal["test", "train", "valid"]
-    ) -> tf.data.Dataset:
+        # Decode the image
+        image = tf.image.decode_jpeg(parsed_example["image/encoded"], channels=3)
+        image = tf.cast(image, tf.float32)
+        image /= 255.0
+
+        # Prepare bounding boxes
+        xmin = tf.sparse.to_dense(parsed_example["image/object/bbox/xmin"])
+        xmax = tf.sparse.to_dense(parsed_example["image/object/bbox/xmax"])
+        ymin = tf.sparse.to_dense(parsed_example["image/object/bbox/ymin"])
+        ymax = tf.sparse.to_dense(parsed_example["image/object/bbox/ymax"])
+        boxes = tf.stack([ymin, xmin, ymax, xmax], axis=-1)
+
+        # Convert labels to dense and format bounding boxes
+        labels = tf.sparse.to_dense(parsed_example["image/object/class/label"])
+        boxes = keras_cv.bounding_box.convert_format(
+            boxes, source="yxyx", target=bounding_box_format, images=image
+        )
+
+        # Construct the return dictionary
+        return {
+            "images": image,
+            "bounding_boxes": {
+                "boxes": boxes,
+                "classes": labels,
+            },
+        }
+
+    def parse_tfrecord_fn_one_hot(
+        self, example: tf.Tensor, bounding_box_format: str
+    ) -> Dict:
         """
-        Creates a TensorFlow dataset for a specific subset of the data (train, validation, test).
+        Parses a TFRecord example into formatted images and bounding boxes, with labels as one-hot-encoded vectors.
 
         Parameters:
-            subset (str): The subset of the dataset to load ('train', 'valid', 'test').
+        - example: A serialized TFRecord example.
+        - bounding_box_format: The target format for bounding boxes.
 
         Returns:
-            tf.data.Dataset: The constructed TensorFlow dataset.
+        A dictionary with keys 'images' and 'bounding_boxes'.
         """
-        tfrecord_path = f"{self.dataset_dir}/{subset}/Sea-Vessels.tfrecord"
-        raw_dataset = tf.data.TFRecordDataset(tfrecord_path)
-        parsed_dataset = raw_dataset.map(
-            self.parse_tfrecord_fn, num_parallel_calls=self.autotune
-        )
-        return parsed_dataset
+        # Feature description for TFRecord example parsing
+        feature_description = {
+            "image/encoded": tf.io.FixedLenFeature([], tf.string),
+            "image/object/class/label": tf.io.VarLenFeature(tf.int64),
+            "image/object/bbox/xmin": tf.io.VarLenFeature(tf.float32),
+            "image/object/bbox/xmax": tf.io.VarLenFeature(tf.float32),
+            "image/object/bbox/ymin": tf.io.VarLenFeature(tf.float32),
+            "image/object/bbox/ymax": tf.io.VarLenFeature(tf.float32),
+        }
+        parsed_example = tf.io.parse_single_example(example, feature_description)
 
-    def get_dataloader(
-        self, subset: Literal["test", "train", "valid"]
+        # Decode the image
+        image = tf.image.decode_jpeg(parsed_example["image/encoded"], channels=3)
+        image = tf.cast(image, tf.float32) / 255.0  # Normalize image pixels to [0, 1]
+
+        # Prepare bounding boxes
+        xmin = tf.sparse.to_dense(parsed_example["image/object/bbox/xmin"])
+        xmax = tf.sparse.to_dense(parsed_example["image/object/bbox/xmax"])
+        ymin = tf.sparse.to_dense(parsed_example["image/object/bbox/ymin"])
+        ymax = tf.sparse.to_dense(parsed_example["image/object/bbox/ymax"])
+        boxes = tf.stack([ymin, xmin, ymax, xmax], axis=-1)
+
+        # Convert labels to one-hot-encoded vectors
+        labels = tf.sparse.to_dense(parsed_example["image/object/class/label"])
+        one_hot_labels = tf.one_hot(labels, depth=8)  # Assuming 8 classes
+
+        # Optional: If you need to adjust bounding boxes format
+        if bounding_box_format != "yxyx":
+            boxes = keras_cv.bounding_box.convert_format(
+                boxes, source="yxyx", target=bounding_box_format, images=image
+            )
+
+        # Construct the return dictionary
+        return {
+            "images": image,
+            "bounding_boxes": {
+                "boxes": boxes,
+                "classes": one_hot_labels,
+            },
+        }
+
+    def load_dataset(
+        self,
+        split: Literal["train", "test", "valid"],
+        bounding_box_format: str,
+        batch_size: int,
     ) -> tf.data.Dataset:
         """
         Prepares and returns a DataLoader for a given subset of the dataset.
@@ -98,24 +149,113 @@ class VesselDatasetLoader:
         Returns:
             tf.data.Dataset: A DataLoader object ready for model training or evaluation.
         """
-        dataset = self.create_dataset(subset)
-        if subset == "train":
-            dataset = dataset.shuffle(1000)
-
-        padded_shapes = ([None, None, 3], {"labels": [None], "bboxes": [None, 4]})
-        padding_values = (
-            tf.constant(0, dtype=tf.uint8),
-            {
-                "labels": tf.constant(-1, dtype=tf.int64),
-                "bboxes": tf.constant(0.0, dtype=tf.float32),
-            },
+        tfrecord_path = f"{self.dataset_dir}/{split}/Sea-Vessels.tfrecord"
+        dataset = tf.data.TFRecordDataset(tfrecord_path)
+        dataset = dataset.map(
+            lambda x: self.parse_tfrecord_fn_one_hot(x, bounding_box_format),
+            num_parallel_calls=self.autotune,
         )
 
+        if split == "train":
+            dataset = dataset.shuffle(batch_size * 4)
+
+        dataset = dataset.ragged_batch(batch_size, drop_remainder=True)
+        dataset = dataset.prefetch(self.autotune)
+
+        return dataset
+
+    def load_padded_dataset(
+        self,
+        split: Literal["train", "test", "valid"],
+        bounding_box_format: str,
+        batch_size: int,
+    ) -> tf.data.Dataset:
+        """
+        Prepares and returns a DataLoader for a given subset of the dataset.
+        """
+        tfrecord_path = f"{self.dataset_dir}/{split}/Sea-Vessels.tfrecord"
+        dataset = tf.data.TFRecordDataset(tfrecord_path)
+        dataset = dataset.map(
+            lambda x: self.parse_tfrecord_fn(x, bounding_box_format),
+            num_parallel_calls=self.autotune,
+        )
+
+        if split == "train":
+            dataset = dataset.shuffle(batch_size * 4)
+
+        # Adjusted padded_shapes for flexibility in the number of boxes and labels
+        padded_shapes = {
+            "images": [416, 416, 3],  # Assuming images can be of variable size
+            "bounding_boxes": {
+                "boxes": [None, 4],
+                "classes": [None],
+            },  # Allow any number of boxes
+        }
+        padding_values = {
+            "images": 0.0,  # Assuming images are normalized to [0, 1]
+            "bounding_boxes": {"boxes": 0.0, "classes": tf.constant(0, dtype=tf.int64)},
+        }
+
         dataset = dataset.padded_batch(
-            self.batch_size,
+            batch_size,
             padded_shapes=padded_shapes,
             padding_values=padding_values,
-            drop_remainder=False,
-        ).prefetch(buffer_size=self.autotune)
+            drop_remainder=True,
+        )
+
+        dataset = dataset.prefetch(self.autotune)
+        return dataset
+
+    def load_dataset_images_labels(
+        self,
+        split: Literal["train", "test", "valid"],
+        batch_size: int,
+        num_classes: int,
+    ) -> tf.data.Dataset:
+        """
+        Prepares and returns a DataLoader for a given subset of the dataset, including only images and their one-hot encoded labels.
+
+        Parameters:
+            split (str): The subset for which to prepare the DataLoader ('train', 'valid', 'test').
+            batch_size (int): The size of the batches to return.
+            num_classes (int): The number of distinct classes.
+
+        Returns:
+            tf.data.Dataset: A DataLoader object ready for model training or evaluation, yielding images and one-hot encoded labels.
+        """
+        tfrecord_path = f"{self.dataset_dir}/{split}/Sea-Vessels.tfrecord"
+        dataset = tf.data.TFRecordDataset(tfrecord_path)
+
+        def parse_tfrecord_fn_images_labels(example: tf.Tensor) -> Dict[str, tf.Tensor]:
+            # Feature description for TFRecord example parsing
+            feature_description = {
+                "image/encoded": tf.io.FixedLenFeature([], tf.string),
+                "image/object/class/label": tf.io.VarLenFeature(tf.int64),
+            }
+            parsed_example = tf.io.parse_single_example(example, feature_description)
+
+            # Decode the image
+            image = tf.image.decode_jpeg(parsed_example["image/encoded"], channels=3)
+            image = (
+                tf.cast(image, tf.float32) / 255.0
+            )  # Normalize image pixels to [0, 1]
+
+            # Convert labels to dense and one-hot-encoded vectors
+            labels = tf.sparse.to_dense(parsed_example["image/object/class/label"])
+            one_hot_labels = tf.reduce_max(
+                tf.one_hot(labels, depth=num_classes), axis=0
+            )
+
+            return image, one_hot_labels
+
+        dataset = dataset.map(
+            parse_tfrecord_fn_images_labels, num_parallel_calls=self.autotune
+        )
+
+        if split == "train":
+            dataset = dataset.shuffle(batch_size * 4)
+
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(self.autotune)
 
         return dataset
